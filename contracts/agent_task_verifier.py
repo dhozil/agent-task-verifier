@@ -40,6 +40,12 @@ class AgentTask:
     deliverable_url: str
     deliverable_desc: str
     verification_reasoning: str
+
+
+@allow_storage
+@dataclass
+class AgentRecord:
+    agent: str
     reputation_score: u256
     total_tasks: u256
     passed_tasks: u256
@@ -59,9 +65,15 @@ def _task_to_dict(t: AgentTask) -> dict:
         "deliverable_url": t.deliverable_url,
         "deliverable_desc": t.deliverable_desc,
         "verification_reasoning": t.verification_reasoning,
-        "reputation_score": int(t.reputation_score),
-        "total_tasks": int(t.total_tasks),
-        "passed_tasks": int(t.passed_tasks),
+    }
+
+
+def _record_to_dict(r: AgentRecord) -> dict:
+    return {
+        "agent": r.agent,
+        "reputation_score": int(r.reputation_score),
+        "total_tasks": int(r.total_tasks),
+        "passed_tasks": int(r.passed_tasks),
     }
 
 
@@ -135,12 +147,41 @@ class AgentTaskVerifier(gl.Contract):
     next_task_id: u256
     tasks: TreeMap[str, AgentTask]
     agent_tasks: TreeMap[str, str]
+    agent_records: TreeMap[str, AgentRecord]
 
     def __init__(self) -> None:
         self.owner = gl.message.sender_address
         self.next_task_id = u256(0)
         self.tasks = gl.storage.inmem_allocate(TreeMap[str, AgentTask])
         self.agent_tasks = gl.storage.inmem_allocate(TreeMap[str, str])
+        self.agent_records = gl.storage.inmem_allocate(TreeMap[str, AgentRecord])
+
+    def _apply_outcome(self, agent: str, passed: bool) -> int:
+        """Apply one verdict to the agent's single cumulative record."""
+        if agent in self.agent_records:
+            rec = self.agent_records[agent]
+            score = int(rec.reputation_score)
+            total = int(rec.total_tasks)
+            passed_total = int(rec.passed_tasks)
+        else:
+            score = 50
+            total = 0
+            passed_total = 0
+
+        total += 1
+        if passed:
+            passed_total += 1
+            score = min(100, score + 5)
+        else:
+            score = max(0, score - 10)
+
+        self.agent_records[agent] = AgentRecord(
+            agent=agent,
+            reputation_score=u256(score),
+            total_tasks=u256(total),
+            passed_tasks=u256(passed_total),
+        )
+        return score
 
     @gl.public.write
     def create_task(
@@ -166,12 +207,21 @@ class AgentTaskVerifier(gl.Contract):
 
         deadline_dt = datetime.now() + timedelta(days=deadline_days)
 
+        agent_key = agent_address.strip()
+        if agent_key not in self.agent_records:
+            self.agent_records[agent_key] = AgentRecord(
+                agent=agent_key,
+                reputation_score=u256(50),
+                total_tasks=u256(0),
+                passed_tasks=u256(0),
+            )
+
         self.tasks[task_id] = AgentTask(
             id=task_id,
             title=title.strip(),
             specification=specification.strip(),
             creator=gl.message.sender_address.as_hex,
-            agent=agent_address.strip(),
+            agent=agent_key,
             status=STATUS_OPEN,
             created_at=str(datetime.now()),
             deadline=deadline_dt.isoformat(),
@@ -179,14 +229,11 @@ class AgentTaskVerifier(gl.Contract):
             deliverable_url="",
             deliverable_desc="",
             verification_reasoning="",
-            reputation_score=u256(50),
-            total_tasks=u256(0),
-            passed_tasks=u256(0),
         )
 
-        existing = json.loads(self.agent_tasks.get(agent_address.strip(), "[]"))
+        existing = json.loads(self.agent_tasks.get(agent_key, "[]"))
         existing.append(task_id)
-        self.agent_tasks[agent_address.strip()] = json.dumps(existing)
+        self.agent_tasks[agent_key] = json.dumps(existing)
 
         return task_id
 
@@ -269,17 +316,13 @@ class AgentTaskVerifier(gl.Contract):
         result = gl.vm.run_nondet_unsafe(verify_fn, validator_fn)
 
         t.verification_reasoning = result["reasoning"]
-        t.total_tasks = u256(int(t.total_tasks) + 1)
 
         if result["decision"] == DECISION_PASS:
             t.status = STATUS_VERIFIED
-            t.passed_tasks = u256(int(t.passed_tasks) + 1)
-            new_score = min(100, int(t.reputation_score) + 5)
         else:
             t.status = STATUS_REJECTED
-            new_score = max(0, int(t.reputation_score) - 10)
 
-        t.reputation_score = u256(new_score)
+        new_score = self._apply_outcome(t.agent, result["decision"] == DECISION_PASS)
 
         return {
             "decision": result["decision"],
@@ -303,9 +346,7 @@ class AgentTaskVerifier(gl.Contract):
             raise gl.vm.UserError("Verification deadline has not passed")
 
         t.status = STATUS_AUTO_PASSED
-        t.total_tasks = u256(int(t.total_tasks) + 1)
-        t.passed_tasks = u256(int(t.passed_tasks) + 1)
-        t.reputation_score = u256(min(100, int(t.reputation_score) + 5))
+        self._apply_outcome(t.agent, True)
 
     @gl.public.view
     def get_task(self, task_id: str) -> dict:
@@ -328,14 +369,6 @@ class AgentTaskVerifier(gl.Contract):
 
     @gl.public.view
     def get_agent_reputation(self, agent_address: str) -> dict:
-        ids = json.loads(self.agent_tasks.get(agent_address, "[]"))
-        tasks = [self.tasks[tid] for tid in ids if tid in self.tasks]
-        if not tasks:
-            return {"agent": agent_address, "reputation_score": 50, "total_tasks": 0, "passed_tasks": 0}
-        latest = tasks[-1]
-        return {
-            "agent": agent_address,
-            "reputation_score": int(latest.reputation_score),
-            "total_tasks": int(latest.total_tasks),
-            "passed_tasks": int(latest.passed_tasks),
-        }
+        if agent_address in self.agent_records:
+            return _record_to_dict(self.agent_records[agent_address])
+        return {"agent": agent_address, "reputation_score": 50, "total_tasks": 0, "passed_tasks": 0}
